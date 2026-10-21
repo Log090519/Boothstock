@@ -230,6 +230,7 @@ p{margin:0}
 <main id="player"></main>
 <main id="board" hidden></main>
 <div id="net" class="net" hidden>연결이 끊겼어요. 와이파이나 데이터를 확인해 주세요.</div>
+<div id="hostWarn" class="net" hidden>호스트 연결이 끊겼어요. 1분 안에 다시 연결되지 않으면 대기 방으로 돌아가요.</div>
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 <div id="modal" class="modal" hidden role="alertdialog" aria-modal="true" aria-labelledby="modalMsg"><div class="modal-box"><p id="modalMsg"></p><button type="button" class="btn primary" id="modalOk">확인</button></div></div>
 
@@ -271,6 +272,9 @@ const CONFIG = {
   newsMax: 11,          // 한 판 뉴스 최대 개수
   dailyCountedRounds: 3, // 하루 랭킹에 인정하는 1인당 판 수
   hostEmails: ["log090519@gmail.com"], // ?board(부스 모니터)에 로그인할 수 있는 구글 계정. database.rules.json에도 같은 주소를 넣어야 해요.
+  // 호스트 연결 판단: 운영자가 화면을 만지는지와는 상관없어요. 모니터 페이지가 열려 있고 인터넷에 연결돼 있으면 "연결됨"이에요.
+  // 탭을 닫거나, 노트북이 잠자기에 들어가거나, 인터넷이 끊기거나, 로그아웃하면 "끊김"이 돼요.
+  hostStaleSec: 30,     // 서버가 끊김을 늦게 알아챌 때를 대비해, 모니터의 자동 신호가 이 시간 넘게 없으면 끊김으로 봐요
   hostTimeoutSec: 60,   // 모니터(호스트) 연결이 이 시간 동안 끊기면 방을 닫고 참가자를 대기 방으로 보내요
   hostLostMsg: "호스트 연결이 끊어져 대기 방으로 돌아갑니다."
 };
@@ -502,6 +506,7 @@ class LocalStore {
   async remove(p){ this._set(p, null); this._emit(); }
   async tx(p, fn){ const r = fn(clone(this._get(p))); if (r === undefined) return { committed:false, value:clone(this._get(p)) }; this._set(p, clone(r)); this._emit(); return { committed:true, value:clone(r) }; }
   onConnected(cb){ cb(true); }
+  presence(p){ this.set(p, { online:true, at:this.now() }); }
 }
 class FirebaseStore {
   constructor(cfg){ firebase.initializeApp(cfg); this.db = firebase.database(); this.offset = 0;
@@ -513,6 +518,10 @@ class FirebaseStore {
   remove(p){ return this.db.ref(p).remove(); }
   async tx(p, fn){ const r = await this.db.ref(p).transaction(fn); return { committed:r.committed, value:r.snapshot.val() }; }
   onConnected(cb){ this.db.ref(".info/connected").on("value", s => cb(!!s.val())); }
+  // 접속이 끊기면 Firebase 서버가 대신 "끊김"을 적어 줘요 (탭 닫기, 잠자기, 인터넷 끊김)
+  presence(p){ const ref = this.db.ref(p), TS = firebase.database.ServerValue.TIMESTAMP;
+    this.db.ref(".info/connected").on("value", s => { if (!s.val()) return;
+      ref.onDisconnect().set({ online:false, at:TS }).then(() => ref.set({ online:true, at:TS })).catch(e => console.warn(e)); }); }
 }
 function loadScript(src){ return new Promise((res, rej) => { const s = document.createElement("script"); s.src = src; s.onload = res; s.onerror = () => rej(new Error(src)); document.head.appendChild(s); }); }
 
@@ -543,12 +552,18 @@ function trade(rid, pid, sid, kind, n, price){
 
 /* ===================== 진행 엔진 (부스 모니터가 담당) ===================== */
 function hostId(){ try { let id = sessionStorage.getItem("msm.host"); if (!id){ id = "h" + uid(); sessionStorage.setItem("msm.host", id); } return id; } catch(e){ return "h" + uid(); } }
+// 백그라운드 탭에서도 느려지지 않는 타이머 (브라우저가 숨긴 탭의 타이머를 1분에 한 번으로 늦추는 걸 피해요)
+function makeTicker(ms, fn){
+  try { const w = new Worker(URL.createObjectURL(new Blob([`setInterval(() => postMessage(0), ${ms});`], { type:"text/javascript" }))); w.onmessage = fn; return; }
+  catch(e){ setInterval(fn, ms); }
+}
 const Host = {
   me: hostId(), leader:false, leaseAt:0, cur:null, players:{}, prid:null, unsubP:null, busy:false, lastBotTick:-1, botPlan:{}, force:null,
   start(){
     if (this.started) return; this.started = true;
     store.on("booth/current", v => { this.cur = v; this.loaded = true; this.sub(); });
-    setInterval(() => { this.loop().catch(e => console.warn(e)); }, 200);
+    store.presence("booth/presence/" + this.me);
+    makeTicker(200, () => { this.loop().catch(e => console.warn(e)); });
   },
   sub(){
     const rid = this.cur && this.cur.rid;
@@ -667,7 +682,18 @@ const Host = {
 /* ===================== 공유 화면 상태 ===================== */
 const DEV = (() => { let d = lsGet("msm.dev"); if (!d){ d = "d" + uid() + uid(); lsSet("msm.dev", d); } return d; })();
 const S = { cur:null, players:{}, prid:null, unsubP:null, daily:{}, connected:true, lease:null, leaseLoaded:false };
-function roomClosed(now){ return !DEMO && (!S.lease || now - S.lease.at > CONFIG.hostTimeoutSec*1000); }
+function hostState(now){
+  if (DEMO) return { online:true, closed:false };
+  const ps = Object.values(S.presence || {}).filter(Boolean);
+  const pOnline = ps.some(p => p.online);
+  const leaseAt = S.lease ? S.lease.at : -Infinity;
+  if (pOnline && now - leaseAt <= CONFIG.hostStaleSec*1000) return { online:true, closed:false };
+  if (!ps.length || !S.lease) return { online:false, closed:true };
+  let since = leaseAt; if (!pOnline) for (const p of ps) if (p.at > since) since = p.at;
+  return { online:false, closed: now - since > CONFIG.hostTimeoutSec*1000 };
+}
+function hostOnline(now){ return hostState(now).online; }
+function roomClosed(now){ return hostState(now).closed; }
 function watchShared(){
   store.on("booth/current", v => {
     S.cur = v;
@@ -677,7 +703,8 @@ function watchShared(){
     renderAll();
   });
   store.on("daily/" + seoulDate(store.now()), v => { S.daily = v || {}; renderAll(); });
-  if (!DEMO) store.on("booth/lease", v => { S.lease = v; S.leaseLoaded = true; renderAll(); });
+  if (!DEMO){ store.on("booth/lease", v => { S.lease = v; S.leaseLoaded = true; renderAll(); });
+    store.on("booth/presence", v => { S.presence = v || {}; S.presenceLoaded = true; renderAll(); }); }
   store.onConnected(ok => { S.connected = ok; $("net").hidden = ok; });
 }
 function renderAll(){ if (!$("player").hidden) pRender(); if (!$("board").hidden) bRender(); }
@@ -685,7 +712,7 @@ function renderAll(){ if (!$("player").hidden) pRender(); if (!$("board").hidden
 /* ===================== 참가자 화면 ===================== */
 const P = { me: lsGet("msm.me"), joining:false, name: randomName(), screen:"", lastTick:-1, newsKey:"", latestNo:0 };
 function pScreen(now){
-  const c = S.cur; if (!c || (!DEMO && !S.leaseLoaded)) return "loading";
+  const c = S.cur; if (!c || (!DEMO && (!S.leaseLoaded || !S.presenceLoaded))) return "loading";
   if (roomClosed(now)) return "closed";
   const joined = P.me && P.me.rid === c.rid && S.players[P.me.pid];
   if (joined){
@@ -697,6 +724,7 @@ function pScreen(now){
 }
 async function pJoin(){
   const c = S.cur; if (!c || P.joining) return;
+  if (!hostOnline(store.now())){ toast("호스트 연결을 기다리는 중이에요. 연결되면 다시 눌러 주세요"); return; }
   if (c.phase !== "lobby"){ toast("지금은 판이 진행 중이에요. 끝나고 새 판이 열리면 눌러 주세요"); return; }
   P.joining = true;
   const pid = "p" + uid();
@@ -818,6 +846,7 @@ function pRender(){
   const key = scr === "join" ? scr : scr + ":" + (S.cur ? S.cur.rid : "");
   if (scr === "closed" && P.screen && P.screen !== "closed" && P.screen !== "loading") showModal(CONFIG.hostLostMsg);
   if (scr !== P.screen || key !== P.key){ P.screen = scr; P.key = key; pBuild(scr); }
+  $("hostWarn").hidden = DEMO || scr === "closed" || scr === "loading" || scr === "join" || hostOnline(now);
   pUpdate();
 }
 function lobbyStatus(c, n, now){
@@ -837,16 +866,18 @@ function pUpdate(){
       $("tkl").innerHTML = c.phase === "lobby"
         ? `<span class="label" style="flex-basis:100%">이번 판 종목</span>` + getRound(c).stocks.map(s => `<span class="tk" style="--sc:var(${s.color})"><b>${esc(s.name)}</b><span class="num">${won(s.p0)}</span></span>`).join("")
         : `<span class="label">종목은 판마다 바뀌어요. 다음 판 종목은 입장하면 공개돼요</span>`; }
-    const open = c.phase === "lobby" && n < c.maxPlayers;
+    const online = hostOnline(now);
+    const open = online && c.phase === "lobby" && n < c.maxPlayers;
     const jb = $("joinBtn"); jb.disabled = !open || P.joining;
-    jb.textContent = open ? "참여하기" : c.phase === "lobby" ? "자리가 다 찼어요" : "지금은 판 진행 중";
-    st.textContent = open ? `지금 ${n}/${c.maxPlayers}명 대기 중이에요`
+    jb.textContent = !online ? "호스트 연결 대기 중" : open ? "참여하기" : c.phase === "lobby" ? "자리가 다 찼어요" : "지금은 판 진행 중";
+    st.textContent = !online ? "부스 모니터 연결을 기다리고 있어요. 연결되면 바로 참여할 수 있어요"
+      : open ? `지금 ${n}/${c.maxPlayers}명 대기 중이에요`
       : c.phase === "lobby" ? "이번 판은 꽉 찼어요. 다음 판이 열리면 다시 눌러 주세요"
       : c.phase === "game" ? (now < c.startAt ? "곧 이번 판이 시작해요. 끝나면 다음 판이 열려요" : `이번 판 ${mmss(c.startAt + c.gameSec*1000 - now)} 남음 · 끝나면 다음 판이 열려요`)
       : (now - (c.endAt + c.resultSec*1000) > 4000 ? "새 판을 여는 중이에요. 잠시만 기다려 주세요" : `${Math.max(0, Math.ceil((c.endAt + c.resultSec*1000 - now)/1000))}초 뒤에 새 판이 열려요`);
   } else if (scr === "lobby"){
     const me = S.players[P.me.pid]; $("lName").textContent = me ? me.name : "";
-    $("lStatus").textContent = lobbyStatus(c, n, now);
+    $("lStatus").textContent = hostOnline(now) ? lobbyStatus(c, n, now) : "호스트 연결이 끊겼어요. 다시 연결되면 이어서 시작해요";
     const list = Object.entries(S.players).sort((a, b) => (a[1].joinedAt||0) - (b[1].joinedAt||0));
     let html = ""; for (let i = 0; i < c.maxPlayers; i++){ const it = list[i];
       html += it ? `<li class="on${it[0] === P.me.pid ? " me" : ""}"><span class="nm">${esc(it[1].name)}</span>${it[1].bot ? '<span class="bot">봇</span>' : ""}</li>` : `<li>빈자리</li>`; }
