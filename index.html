@@ -261,8 +261,8 @@ const CONFIG = {
   countdownSec: 5,      // 시작 전 카운트다운
   gameSec: 240,         // 게임 시간 (4분)
   resultSec: 40,        // 결과 화면 시간
-  tickMs: 2000,         // 주가가 바뀌는 간격
-  teaserTicks: 5,       // 뉴스 몇 틱 전에 "곧 발표" 예고를 띄울지 (5틱 = 10초)
+  tickMs: 500,          // 주가·그래프가 바뀌는 간격 (500 = 0.5초, 1초로 하려면 1000)
+  teaserSec: 10,        // 뉴스 몇 초 전에 "곧 발표" 예고를 띄울지
   newsMin: 5,           // 한 판 뉴스 최소 개수
   newsMax: 7,           // 한 판 뉴스 최대 개수
   dailyCountedRounds: 3 // 하루 랭킹에 인정하는 1인당 판 수
@@ -371,8 +371,11 @@ function mulberry32(a){ return function(){ a |= 0; a = a + 0x6D2B79F5 | 0; let t
 function gauss(r){ let u = 0; while (u === 0) u = r(); return Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*r()); }
 function shuffle(a, r){ for (let i = a.length-1; i > 0; i--){ const j = Math.floor(r()*(i+1)); [a[i],a[j]] = [a[j],a[i]]; } return a; }
 
-function genRound(seed, tickMs, gameSec){
+function genRound(seed, tickMs, gameSec, speed){
   const N = Math.round(gameSec*1000 / tickMs);
+  // 한 칸이 게임 속 몇 초인지. 간격을 바꿔도 4분 동안의 흔들림과 뉴스 효과 시간은 그대로예요.
+  const stepSec = tickMs * (speed || 1) / 1000, f = stepSec / 2;
+  const teaser = Math.max(1, Math.round(CONFIG.teaserSec / stepSec));
   const r = mulberry32(seed);
   // 이번 판에 나올 회사 3개
   const picked = shuffle(COMPANIES.slice(), r).slice(0, SLOTS.length);
@@ -383,7 +386,7 @@ function genRound(seed, tickMs, gameSec){
   const ticks = [];
   for (let i = 0; i < k; i++){
     const f = k === 1 ? 0.45 : 0.08 + 0.82 * i / (k - 1);
-    ticks.push(clamp(Math.round(f*N + (r()*2 - 1)*N*0.015), CONFIG.teaserTicks + 1, N - 8));
+    ticks.push(clamp(Math.round(f*N + (r()*2 - 1)*N*0.015), teaser + 1, N - Math.ceil(16 / stepSec)));
   }
   const ev = new Array(k).fill(null);
   const rumorCos = picked.map((co, i) => ({ co, i })).filter(x => x.co.rumor);
@@ -402,13 +405,13 @@ function genRound(seed, tickMs, gameSec){
     let j = pool.findIndex(n => n.kind !== "market" || market < 2); if (j < 0) j = 0;
     const n = pool.splice(j, 1)[0]; if (n.kind === "market") market++; ev[i] = n;
   }
-  const events = ev.map((e, i) => ({ ...e, no:i+1, tick:ticks[i], dur:5 + Math.floor(r()*4), mag:e.m*(0.85 + r()*0.3) }));
+  const events = ev.map((e, i) => ({ ...e, no:i+1, tick:ticks[i], dur:Math.max(1, Math.round((5 + Math.floor(r()*4)) * 2 / stepSec)), mag:e.m*(0.85 + r()*0.3) }));
   const prices = {};
   stocks.forEach((st, idx) => {
     const rs = mulberry32((seed ^ Math.imul(idx+1, 0x9E3779B1)) >>> 0);
     let lp = Math.log(st.p0), anchor = lp; const arr = [st.p0];
     for (let t = 1; t <= N; t++){
-      let d = st.vol * gauss(rs) - 0.015 * (lp - anchor);
+      let d = st.vol * Math.sqrt(f) * gauss(rs) - 0.015 * f * (lp - anchor);
       for (const e of events){
         if (e.s.includes(st.id) && t > e.tick && t <= e.tick + e.dur){ const step = Math.log(1 + e.mag) / e.dur; d += step; anchor += step; }
       }
@@ -417,10 +420,10 @@ function genRound(seed, tickMs, gameSec){
     }
     prices[st.id] = arr;
   });
-  return { N, stocks, events, prices };
+  return { N, stocks, events, prices, teaser, stepSec };
 }
 const roundCache = {};
-function getRound(c){ const k = c.rid + ":" + c.seed + ":" + c.tickMs + ":" + c.gameSec; return roundCache[k] || (roundCache[k] = genRound(c.seed, c.tickMs, c.gameSec)); }
+function getRound(c){ const k = c.rid + ":" + c.seed + ":" + c.tickMs + ":" + c.gameSec + ":" + (c.speed || 1); return roundCache[k] || (roundCache[k] = genRound(c.seed, c.tickMs, c.gameSec, c.speed || 1)); }
 function curTick(c, now, R){ if (c.endTick >= 0) return c.endTick; return clamp(Math.floor((now - c.startAt) / c.tickMs), 0, R.N); }
 function pricesAt(R, t){ const o = {}; for (const s of R.stocks) o[s.id] = R.prices[s.id][t]; return o; }
 function valueOf(p, pr){ let v = p.cash || 0; for (const id in pr) v += ((p.h && p.h[id]) || 0) * pr[id]; return v; }
@@ -492,7 +495,7 @@ const Host = {
   me: uid(), leader:false, leaseAt:0, cur:null, players:{}, prid:null, unsubP:null, busy:false, lastBotTick:-1, botPlan:{}, force:null,
   start(){
     store.on("booth/current", v => { this.cur = v; this.loaded = true; this.sub(); });
-    setInterval(() => { this.loop().catch(e => console.warn(e)); }, 500);
+    setInterval(() => { this.loop().catch(e => console.warn(e)); }, 200);
   },
   sub(){
     const rid = this.cur && this.cur.rid;
@@ -535,7 +538,7 @@ const Host = {
     const fast = DEMO && demoFast;
     const meta = { rid: Date.now().toString(36) + uid().slice(0,4), phase:"lobby", seed:(Math.random()*2147483647) | 0,
       createdAt:store.now(), firstJoinAt:0, startAt:0, endAt:0, endTick:-1,
-      tickMs: fast ? 500 : CONFIG.tickMs, gameSec: fast ? Math.round(CONFIG.gameSec/4) : CONFIG.gameSec, resultSec: fast ? 15 : CONFIG.resultSec,
+      tickMs: fast ? CONFIG.tickMs/4 : CONFIG.tickMs, speed: fast ? 4 : 1, gameSec: fast ? Math.round(CONFIG.gameSec/4) : CONFIG.gameSec, resultSec: fast ? 15 : CONFIG.resultSec,
       maxPlayers: CONFIG.maxPlayers, prevRid: old ? old.rid : "" };
     await store.set("booth/current", meta);
     if (old && old.prevRid) store.remove("rounds/" + old.prevRid);
@@ -570,27 +573,31 @@ const Host = {
     if (now < c.startAt) return;
     const R = getRound(c);
     const t = clamp(Math.floor((now - c.startAt) / c.tickMs), 0, R.N - 1);
-    if (t === this.lastBotTick) return; this.lastBotTick = t;
+    if (t <= this.lastBotTick) return;
+    const from = this.lastBotTick + 1; this.lastBotTick = t;
+    const passed = tk => tk >= from && tk <= t;           // 지난번 이후 지나간 칸인지
     const pr = pricesAt(R, t);
     const pick = a => a[Math.floor(Math.random()*a.length)];
     const ids = R.stocks.map(s => s.id);
+    const sec = Math.max(1, Math.round(2 / R.stepSec));    // 게임 속 2초에 해당하는 칸 수
+    const steps = t - from + 1;
     for (const [pid, p] of Object.entries(this.players)){
       if (!p.bot) continue;
       const plan = this.botPlan[pid] || (this.botPlan[pid] = { delay:{} });
       const acts = [];
-      if (p.bot === "holder" && t === 1){
+      if (p.bot === "holder" && passed(sec)){
         const two = shuffle(ids.slice(), Math.random).slice(0, 2);
         for (const s of two) acts.push(["buy", s, Math.floor(CONFIG.startCash * 0.45 / pr[s])]);
       }
-      if (p.bot === "random" && t > 0 && Math.random() < 0.1){
+      if (p.bot === "random" && t > 0 && Math.random() < 1 - Math.pow(1 - 0.1 * R.stepSec / 2, steps)){
         const s = pick(ids);
         if (Math.random() < 0.55) acts.push(["buy", s, 1 + Math.floor(Math.random()*4)]); else acts.push(["sell", s, "all"]);
       }
       if (p.bot === "news"){
-        if (t === 1) acts.push(["buy", pick(ids), 2]);
+        if (passed(sec)) acts.push(["buy", pick(ids), 2]);
         R.events.forEach((e, i) => {
-          if (plan.delay[i] == null) plan.delay[i] = 1 + Math.floor(Math.random()*3);
-          if (t === e.tick + plan.delay[i]){
+          if (plan.delay[i] == null) plan.delay[i] = Math.round((1 + Math.random()*2) * sec);  // 게임 속 2~6초 뒤 반응
+          if (passed(e.tick + plan.delay[i])){
             if (e.mag > 0) acts.push(["buy", e.s.length > 1 ? pick(e.s) : e.s[0], "max"]);
             else for (const s of e.s) acts.push(["sell", s, "all"]);
           }
@@ -618,7 +625,7 @@ function watchShared(){
 function renderAll(){ if (!$("player").hidden) pRender(); if (!$("board").hidden) bRender(); }
 
 /* ===================== 참가자 화면 ===================== */
-const P = { me: lsGet("msm.me"), want:false, joining:false, name: randomName(), screen:"", lastTick:-1, newsKey:"", latestNo:0 };
+const P = { me: lsGet("msm.me"), joining:false, name: randomName(), screen:"", lastTick:-1, newsKey:"", latestNo:0 };
 function pScreen(now){
   const c = S.cur; if (!c) return "loading";
   const joined = P.me && P.me.rid === c.rid && S.players[P.me.pid];
@@ -627,10 +634,11 @@ function pScreen(now){
     if (c.phase === "game") return now < c.startAt ? "countdown" : "game";
     return "result";
   }
-  return P.want ? "queue" : "join";
+  return "join";
 }
 async function pJoin(){
-  const c = S.cur; if (!c || c.phase !== "lobby" || P.joining) return;
+  const c = S.cur; if (!c || P.joining) return;
+  if (c.phase !== "lobby"){ toast("지금은 판이 진행 중이에요. 끝나고 새 판이 열리면 눌러 주세요"); return; }
   P.joining = true;
   const pid = "p" + uid();
   const base = (P.name || "").trim().slice(0, 10) || randomName();
@@ -642,8 +650,9 @@ async function pJoin(){
       cur[pid] = { name:nm, bot:false, deviceId:DEV, cash:CONFIG.startCash, h:{ A:0, B:0, C:0 }, joinedAt:store.now(), trades:0 };
       return cur;
     });
-    if (r.committed && r.value && r.value[pid]){ P.me = { rid:c.rid, pid }; lsSet("msm.me", P.me); P.want = false; }
-  } catch(e){ console.warn(e); }
+    if (r.committed && r.value && r.value[pid]){ P.me = { rid:c.rid, pid }; lsSet("msm.me", P.me); }
+    else toast("이번 판은 자리가 다 찼어요. 다음 판에 다시 눌러 주세요");
+  } catch(e){ console.warn(e); toast("입장하지 못했어요. 다시 눌러 주세요"); }
   P.joining = false; pRender();
 }
 function pBuild(scr){
@@ -663,14 +672,7 @@ function pBuild(scr){
       <p class="status" id="joinStatus"></p></div>`;
     $("nick").addEventListener("input", e => { P.name = e.target.value; });
     $("dice").addEventListener("click", () => { P.name = randomName(); $("nick").value = P.name; });
-    $("joinBtn").addEventListener("click", () => { P.name = $("nick").value; P.want = true; askWakeLock(); pRender(); });
-    return;
-  }
-  if (scr === "queue"){
-    el.innerHTML = `<div class="wrap"><div class="bigmsg"><h2>자리가 나면 바로 입장해요</h2><p id="qStatus"></p></div>
-      <div class="mini" id="qMini">${getRound(c).stocks.map(s => `<div><span class="n">${esc(s.name)}</span><b class="num" id="qp-${s.id}">${won(s.p0)}</b><span class="chg num" id="qc-${s.id}"></span></div>`).join("")}</div>
-      <button type="button" class="btn ghost" id="qCancel">취소</button></div>`;
-    $("qCancel").addEventListener("click", () => { P.want = false; pRender(); });
+    $("joinBtn").addEventListener("click", () => { P.name = $("nick").value; askWakeLock(); pJoin(); });
     return;
   }
   if (scr === "lobby"){
@@ -738,7 +740,7 @@ function drawSpark(cv, arr, t, p0){
 }
 function newsHTML(R, t, c, now, compact){
   const past = R.events.filter(e => e.tick <= t).sort((a, b) => b.tick - a.tick);
-  const teaser = R.events.find(e => t >= e.tick - CONFIG.teaserTicks && t < e.tick);
+  const teaser = R.events.find(e => t >= e.tick - R.teaser && t < e.tick);
   const latest = past[0];
   let html = "";
   if (teaser) html += `<div class="teaser"><span class="dot"></span>곧 ${esc(teaserName(R, teaser))} 관련 발표가 있어요</div>`;
@@ -755,8 +757,6 @@ function pRender(){
   const scr = pScreen(now);
   const key = scr === "join" ? scr : scr + ":" + (S.cur ? S.cur.rid : "");
   if (scr !== P.screen || key !== P.key){ P.screen = scr; P.key = key; pBuild(scr); }
-  // 자동 입장
-  if (scr === "queue" && S.cur && S.cur.phase === "lobby" && Object.keys(S.players).length < S.cur.maxPlayers) pJoin();
   pUpdate();
 }
 function lobbyStatus(c, n, now){
@@ -776,16 +776,13 @@ function pUpdate(){
       $("tkl").innerHTML = c.phase === "lobby"
         ? `<span class="label" style="flex-basis:100%">이번 판 종목</span>` + getRound(c).stocks.map(s => `<span class="tk" style="--sc:var(${s.color})"><b>${esc(s.name)}</b><span class="num">${won(s.p0)}</span></span>`).join("")
         : `<span class="label">종목은 판마다 바뀌어요. 다음 판 종목은 입장하면 공개돼요</span>`; }
-    st.textContent = c.phase === "lobby" ? (n < c.maxPlayers ? `지금 ${n}/${c.maxPlayers}명 대기 중이에요` : "이번 판은 자리가 다 찼어요. 누르면 다음 판에 들어가요")
-      : c.phase === "game" ? `지금 판 진행 중 · 끝나면 바로 다음 판에 들어갈 수 있어요` : "곧 새 판이 열려요";
-  } else if (scr === "queue"){
-    const q = $("qStatus"); if (!q) return;
-    if (c.phase === "game"){
-      const R = getRound(c); const t = now < c.startAt ? 0 : curTick(c, now, R); const pr = pricesAt(R, t);
-      q.textContent = now < c.startAt ? "지금 판이 곧 시작해요. 끝나면 바로 들어가요" : `지금 판 진행 중 · ${mmss(c.startAt + c.gameSec*1000 - now)} 남음`;
-      for (const s of R.stocks){ const ci = chgInfo(pr[s.id], s.p0); $("qp-" + s.id).textContent = won(pr[s.id]); const ce = $("qc-" + s.id); ce.textContent = ci.txt; ce.className = "chg num " + ci.cls; }
-    } else if (c.phase === "result") q.textContent = "결과 발표 중이에요. 곧 새 판이 열려요";
-    else q.textContent = n >= c.maxPlayers ? "이번 판은 꽉 찼어요. 다음 판을 기다려 주세요" : "입장하는 중…";
+    const open = c.phase === "lobby" && n < c.maxPlayers;
+    const jb = $("joinBtn"); jb.disabled = !open || P.joining;
+    jb.textContent = open ? "참여하기" : c.phase === "lobby" ? "자리가 다 찼어요" : "지금은 판 진행 중";
+    st.textContent = open ? `지금 ${n}/${c.maxPlayers}명 대기 중이에요`
+      : c.phase === "lobby" ? "이번 판은 꽉 찼어요. 다음 판이 열리면 다시 눌러 주세요"
+      : c.phase === "game" ? (now < c.startAt ? "곧 이번 판이 시작해요. 끝나면 다음 판이 열려요" : `이번 판 ${mmss(c.startAt + c.gameSec*1000 - now)} 남음 · 끝나면 다음 판이 열려요`)
+      : `${Math.max(0, Math.ceil((c.endAt + c.resultSec*1000 - now)/1000))}초 뒤에 새 판이 열려요`;
   } else if (scr === "lobby"){
     const me = S.players[P.me.pid]; $("lName").textContent = me ? me.name : "";
     $("lStatus").textContent = lobbyStatus(c, n, now);
@@ -834,7 +831,7 @@ function pResult(c, now){
   const rk = ranking(S.players, pr); const idx = rk.findIndex(r => r.pid === P.me.pid); const mine = rk[idx];
   const d = S.daily[DEV];
   const left = Math.max(0, Math.ceil((c.endAt + c.resultSec*1000 - now)/1000));
-  const key = JSON.stringify([rk.map(r => r.value), d, left, P.want]);
+  const key = JSON.stringify([rk.map(r => r.value), d, left]);
   if (key === P.resKey) return; P.resKey = key;
   const ret = retInfo(mine ? mine.ret : 0);
   const dailyTxt = d ? (d.rounds <= CONFIG.dailyCountedRounds ? `오늘 랭킹 반영 ${d.rounds}/${CONFIG.dailyCountedRounds}판 · 내 최고 ${retInfo(d.best).txt}` : `오늘 랭킹에는 처음 ${CONFIG.dailyCountedRounds}판만 반영돼요 · 내 최고 ${retInfo(d.best).txt}`) : "";
@@ -844,10 +841,7 @@ function pResult(c, now){
     <div class="card"><ol class="ranklist">${rk.map((r, i) => { const ri = retInfo(r.ret); return `<li class="${r.pid === P.me.pid ? "me" : ""}"><span class="pos">${i + 1}</span><span class="who"><span class="nm">${esc(r.name)}</span>${r.bot ? '<span class="bot">봇</span>' : ""}</span><span class="num">${won(r.value)}</span><span class="ret num ${ri.cls}">${ri.txt}</span></li>`; }).join("")}</ol></div>
     ${lessonsHTML(R, et, 3)}
     ${dailyTxt ? `<p class="daily">${dailyTxt}</p>` : ""}
-    <button type="button" class="btn primary" id="again">${P.want ? "다음 판 입장 대기 중" : "다음 판도 참여하기"}</button>
-    <p class="status">다음 판은 ${left}초 뒤에 열려요</p>`;
-  $("again").addEventListener("click", () => { P.want = true; P.resKey = ""; pRender(); });
-  $("again").disabled = P.want;
+    <p class="status">다음 판은 ${left}초 뒤에 열려요. 또 하고 싶으면 그때 참여하기를 눌러 주세요</p>`;
 }
 
 /* ===================== 부스 모니터 화면 ===================== */
@@ -867,7 +861,7 @@ function bBuild(scr){
   const side = `<aside class="b-side">
       <div class="panel"><h2>이번 판 순위</h2><ol class="ranklist" id="bRank"></ol></div>
       <div class="panel"><h2>오늘의 TOP 5 <span class="label" style="display:inline">첫 ${CONFIG.dailyCountedRounds}판 중 최고 수익률</span></h2><ol class="top5" id="bTop"></ol></div>
-      ${scr !== "lobby" ? `<div class="panel smallqr"><div class="qrtile" id="bQRs"></div><p class="qrnote">다음 판에 참여하려면 QR을 찍어 두세요. 자리가 나면 자동으로 들어가요.</p></div>` : ""}
+      ${scr !== "lobby" ? `<div class="panel smallqr"><div class="qrtile" id="bQRs"></div><p class="qrnote">다음 판에 참여하려면 이번 판이 끝난 뒤 QR을 찍고 참여하기를 누르세요.</p></div>` : ""}
     </aside>`;
   const ctl = `<footer class="b-ctl"><button type="button" id="cStart">지금 시작 (빈자리 봇)</button><button type="button" id="cEnd">이번 판 끝내기</button><button type="button" id="cNext">새 판 바로 열기</button><span class="who" id="cWho"></span></footer>`;
   let main = "";
@@ -943,7 +937,7 @@ function bUpdate(){
     if (t !== B.lastTick){ B.lastTick = t; drawChart($("bChart"), R, t);
       $("bLegend").innerHTML = R.stocks.map(s => { const ci = chgInfo(pr[s.id], s.p0); return `<span style="--sc:var(${s.color})"><i></i>${esc(s.name)} <span class="num">${won(pr[s.id])}</span> <span class="chg ${ci.cls}">${ci.txt}</span></span>`; }).join(""); }
     const past = R.events.filter(e => e.tick <= t).sort((a, b) => b.tick - a.tick);
-    const teaser = R.events.find(e => t >= e.tick - CONFIG.teaserTicks && t < e.tick);
+    const teaser = R.events.find(e => t >= e.tick - R.teaser && t < e.tick);
     let html = teaser ? `<li class="newest"><span class="no">!</span><span class="h">곧 ${esc(teaserName(R, teaser))} 관련 발표가 있어요</span></li>` : "";
     html += past.map((e, i) => `<li class="${i === 0 && !teaser ? "newest" : ""}"><span class="no">${e.no}</span><span class="h">${esc(e.h)}</span></li>`).join("");
     if (!html) html = `<li><span class="no">·</span><span class="h">첫 뉴스를 기다리는 중이에요</span></li>`;
